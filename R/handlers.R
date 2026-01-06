@@ -1,0 +1,507 @@
+# HTTP and WebSocket Handlers Module
+# Handles all HTTP requests and WebSocket connections
+
+# HTTP request handler
+handle_http_request <- function(req, config, template_manager, connection_manager, process_manager = NULL) {
+  "Main HTTP request handler with routing"
+
+  # Validate request inputs
+  validation_result <- validate_request_inputs(
+    req$PATH_INFO,
+    req$REQUEST_METHOD,
+    req$QUERY_STRING
+  )
+
+  if (!validation_result$valid) {
+    return(validation_result$response)
+  }
+
+  path <- validation_result$path
+  method <- validation_result$method
+  query_string <- validation_result$query_string
+
+  logger::log_debug("HTTP request: {method} {path}", method = method, path = path)
+
+  # Attach managers to request for routing
+  req$process_manager <- process_manager
+  req$connection_manager <- connection_manager
+
+  # Route handling
+  return(route_http_request(path, method, query_string, req, config, template_manager, connection_manager))
+}
+
+route_http_request <- function(path, method, query_string, req, config, template_manager, connection_manager) {
+  "Route HTTP requests to appropriate handlers"
+
+  # Landing page
+  if (path == "/" || path == "") {
+    return(handle_landing_page(config, template_manager))
+  }
+
+  # Health check endpoint
+  if (path == "/health") {
+    return(handle_health_check())
+  }
+
+  # API endpoint for app status
+  if (path == "/api/apps") {
+    return(handle_apps_api(config, req$process_manager))
+  }
+
+  # Static files (CSS, JS, images)
+  if (startsWith(path, "/templates/")) {
+    return(handle_static_file(path, template_manager))
+  }
+
+  # Proxy requests to apps
+  if (startsWith(path, "/proxy/")) {
+    # We need to get references to process_manager and connection_manager
+    # This will be passed from the main HTTP handler
+    return(handle_proxy_request(
+      path, method, query_string, req, config,
+      req$process_manager, req$connection_manager
+    ))
+  }
+
+  # 404 for unknown paths
+  return(create_error_response("Not Found", 404))
+}
+
+handle_landing_page <- function(config, template_manager) {
+  "Handle landing page requests"
+
+  tryCatch(
+    {
+      html <- template_manager$generate_landing_page(config)
+      return(create_html_response(html))
+    },
+    error = function(e) {
+      logger::log_error("Error generating landing page: {error}", error = e$message)
+      return(create_error_response("Internal Server Error", 500))
+    }
+  )
+}
+
+handle_health_check <- function() {
+  "Handle health check requests"
+
+  return(create_json_response(list(status = "healthy")))
+}
+
+handle_apps_api <- function(config, process_manager = NULL) {
+  "Handle API requests for app status"
+
+  # This would normally be in management_api.R but needed here for landing page
+  tryCatch(
+    {
+      if (!is.null(process_manager)) {
+        # Use the enhanced status from process manager
+        apps_status <- process_manager$get_all_app_status()
+      } else {
+        # Fallback to basic status if no process manager available
+        apps_status <- list()
+
+        for (app_config in config$get_sorted_apps()) {
+          app_name <- app_config$name
+          process <- config$get_app_process(app_name)
+
+          status <- if (is.null(process)) {
+            if (app_config$resident) "stopped" else "dormant"
+          } else if (is_process_alive(process)) {
+            "running"
+          } else {
+            "crashed"
+          }
+
+          # Get connection count from cache (O(1) instead of O(n))
+          app_connections <- config$get_app_connection_count(app_name)
+
+          apps_status[[app_name]] <- list(
+            name = app_name,
+            status = status,
+            resident = app_config$resident,
+            port = app_config$port,
+            path = app_config$path,
+            connections = app_connections,
+            pid = if (!is.null(process) && is_process_alive(process)) process$get_pid() else NULL
+          )
+        }
+      }
+
+      return(create_json_response(apps_status))
+    },
+    error = function(e) {
+      logger::log_error("Error getting app status: {error}", error = e$message)
+      return(create_error_response("Internal Server Error", 500))
+    }
+  )
+}
+
+handle_static_file <- function(path, template_manager) {
+  "Handle static file requests (CSS, JS, images)"
+
+  # Remove /templates/ prefix
+  file_path <- gsub("^/templates/", "", path)
+
+  return(template_manager$serve_static_file(file_path))
+}
+
+handle_proxy_request <- function(path, method, query_string, req, config, process_manager = NULL, connection_manager = NULL) {
+  "Handle proxy requests to Shiny apps"
+
+  path_parts <- strsplit(path, "/")[[1]]
+  path_parts <- path_parts[path_parts != ""] # Remove empty parts
+
+  if (length(path_parts) < 2) {
+    return(create_error_response("Invalid proxy path", 400))
+  }
+
+  # Validate app name
+  app_name_validation <- validate_app_name(path_parts[2])
+  if (!app_name_validation$valid) {
+    return(create_error_response(paste("Invalid app name:", app_name_validation$error), 400))
+  }
+
+  app_name <- app_name_validation$sanitized
+  app_config <- config$get_app_config(app_name)
+
+  if (is.null(app_config)) {
+    return(create_error_response("App not found", 404))
+  }
+
+  # Start app on demand if it's non-resident and not running
+  if (!app_config$resident && !is.null(process_manager)) {
+    process <- config$get_app_process(app_name)
+    if (is.null(process) || !is_process_alive(process)) {
+      logger::log_info("Starting non-resident app {app_name} on demand for HTTP request", app_name = app_name)
+      success <- process_manager$start_app_on_demand(app_name)
+      if (!success) {
+        return(create_error_response("Failed to start app on demand", 502))
+      }
+    }
+  }
+
+  # Build target URL
+  if (length(path_parts) > 2) {
+    target_path <- paste0("/", paste(path_parts[3:length(path_parts)], collapse = "/"))
+  } else {
+    target_path <- "/"
+  }
+
+  target_url <- paste0("http://127.0.0.1:", app_config$port, target_path)
+
+  # Add query string if present
+  if (!is.null(query_string) && query_string != "") {
+    target_url <- paste0(target_url, "?", query_string)
+  }
+
+  # Forward the request
+  return(forward_request(method, target_url, req, app_name, config))
+}
+
+forward_request <- function(method, target_url, req, app_name, config) {
+  "Forward HTTP request to backend Shiny app"
+
+  tryCatch(
+    {
+      logger::log_debug("Forwarding {method} to {target_url} for app {app_name}",
+        method = method, target_url = target_url, app_name = app_name
+      )
+
+      # Extract port from target_url for availability check
+      port <- as.numeric(gsub(".*:(\\d+).*", "\\1", target_url))
+
+      # Check if app is currently starting up
+      startup_state <- config$get_app_startup_state(app_name)
+      if (!is.null(startup_state)) {
+        if (startup_state$state == "starting") {
+          elapsed <- startup_state$elapsed
+
+          # Allow up to 2 seconds of startup time before returning 503
+          # Poll briefly if within grace period
+          grace_period <- 2
+          if (elapsed < grace_period) {
+            wait_remaining <- grace_period - elapsed
+            start_wait <- Sys.time()
+            while (as.numeric(difftime(Sys.time(), start_wait, units = "secs")) < wait_remaining) {
+              if (is_port_in_use("127.0.0.1", port)) {
+                logger::log_info("App {app_name} became ready during grace period", app_name = app_name)
+                config$set_app_ready(app_name)
+                break
+              }
+              Sys.sleep(0.1)
+            }
+            # Re-check startup state after waiting
+            startup_state <- config$get_app_startup_state(app_name)
+            if (is.null(startup_state) || is_port_in_use("127.0.0.1", port)) {
+              # App is ready, continue to proxy (fall through)
+            } else {
+              # Still not ready after grace period, return 503
+              retry_after <- min(5, max(2, ceiling(3 - grace_period)))
+              logger::log_info("App {app_name} not ready after {grace}s grace period, returning 503",
+                app_name = app_name, grace = grace_period
+              )
+              return(create_503_response(
+                sprintf("App '%s' is starting up, please retry", app_name),
+                retry_after_seconds = retry_after
+              ))
+            }
+          } else {
+            # Past grace period, return 503 immediately
+            retry_after <- min(5, max(2, ceiling(3 - elapsed)))
+            logger::log_info("App {app_name} is starting (elapsed: {elapsed}s), returning 503 with Retry-After: {retry}s",
+              app_name = app_name, elapsed = round(elapsed, 1), retry = retry_after
+            )
+            return(create_503_response(
+              sprintf("App '%s' is starting up, please retry", app_name),
+              retry_after_seconds = retry_after
+            ))
+          }
+        } else if (startup_state$state == "timeout") {
+          # Startup timed out
+          logger::log_error("App {app_name} startup timed out", app_name = app_name)
+          return(create_error_response("App startup timed out", 502))
+        }
+      }
+
+      # Quick single check if port has a process listening (non-blocking)
+      if (!is_port_in_use("127.0.0.1", port)) {
+        # Port not in use but app is not marked as starting
+        # This could mean the app just died or hasn't started yet
+        logger::log_warn("Port {port} not available for app {app_name} but app not in startup state",
+          port = port, app_name = app_name
+        )
+        return(create_503_response(
+          sprintf("App '%s' is not ready", app_name),
+          retry_after_seconds = 2
+        ))
+      }
+
+      # Make the request with timeout
+      timeout_config <- httr::timeout(30)
+
+      # Build headers to forward from original request
+      # Skip hop-by-hop headers and headers that httr manages
+      # Use underscore format to match rook/httpuv header names (HTTP_HEADER_NAME)
+      skip_headers <- c(
+        "HOST", "CONNECTION", "KEEP_ALIVE", "TRANSFER_ENCODING",
+        "TE", "TRAILER", "UPGRADE", "PROXY_AUTHORIZATION",
+        "PROXY_AUTHENTICATE", "CONTENT_LENGTH", "CONTENT_TYPE"
+      )
+
+      forward_headers <- list()
+      for (name in names(req)) {
+        if (startsWith(name, "HTTP_")) {
+          header_name <- substring(name, 6) # Remove "HTTP_" prefix
+          if (!header_name %in% skip_headers) {
+            # Convert underscores to hyphens for HTTP header format
+            header_name_http <- gsub("_", "-", header_name)
+            forward_headers[[header_name_http]] <- req[[name]]
+          }
+        }
+      }
+
+      # Convert to httr's add_headers format
+      headers_config <- if (length(forward_headers) > 0) {
+        do.call(httr::add_headers, forward_headers)
+      } else {
+        NULL
+      }
+
+      if (method == "GET" || method == "HEAD" || method == "OPTIONS") {
+        if (!is.null(headers_config)) {
+          response <- httr::VERB(method, target_url, headers_config, timeout_config)
+        } else {
+          response <- httr::VERB(method, target_url, timeout_config)
+        }
+      } else {
+        # Methods that may have a body (POST, PUT, PATCH, DELETE)
+        # Read body as raw bytes to handle both text and binary data
+        body <- NULL
+        if (!is.null(req$rook.input)) {
+          body <- req$rook.input$read()
+        }
+
+        # Get Content-Type from original request
+        request_content_type <- req$CONTENT_TYPE %||% req$HTTP_CONTENT_TYPE
+
+        # Build the request with body, content type, and forwarded headers
+        if (!is.null(body) && length(body) > 0) {
+          if (!is.null(request_content_type) && !is.null(headers_config)) {
+            response <- httr::VERB(
+              method, target_url,
+              body = body,
+              httr::content_type(request_content_type),
+              headers_config,
+              timeout_config
+            )
+          } else if (!is.null(request_content_type)) {
+            response <- httr::VERB(
+              method, target_url,
+              body = body,
+              httr::content_type(request_content_type),
+              timeout_config
+            )
+          } else if (!is.null(headers_config)) {
+            response <- httr::VERB(method, target_url, body = body, headers_config, timeout_config)
+          } else {
+            response <- httr::VERB(method, target_url, body = body, timeout_config)
+          }
+        } else {
+          if (!is.null(headers_config)) {
+            response <- httr::VERB(method, target_url, headers_config, timeout_config)
+          } else {
+            response <- httr::VERB(method, target_url, timeout_config)
+          }
+        }
+      }
+
+      # Get response headers safely
+      response_headers <- response$headers
+      content_type <- if (!is.null(response_headers) && "content-type" %in% names(response_headers)) {
+        response_headers[["content-type"]]
+      } else {
+        "text/html"
+      }
+
+      # Handle binary vs text content
+      raw_content <- httr::content(response, "raw")
+
+      # Check if content is binary
+      is_binary <- grepl("image/|font/|application/octet-stream|application/pdf", content_type, ignore.case = TRUE) ||
+        any(raw_content == 0)
+
+      # Return response
+      if (is_binary) {
+        return(list(
+          status = httr::status_code(response),
+          headers = list("Content-Type" = content_type),
+          body = raw_content
+        ))
+      } else {
+        return(list(
+          status = httr::status_code(response),
+          headers = list("Content-Type" = content_type),
+          body = rawToChar(raw_content)
+        ))
+      }
+    },
+    error = function(e) {
+      logger::log_error("Proxy error for app {app_name}: {error}",
+        app_name = app_name, error = e$message
+      )
+      return(create_error_response(paste("Bad Gateway:", e$message), 502))
+    }
+  )
+}
+
+# WebSocket handler
+handle_websocket_connection <- function(ws, config, connection_manager, process_manager = NULL) {
+  "Handle new WebSocket connections"
+
+  logger::log_info("WebSocket connection opened")
+
+  # Generate session ID
+  session_id <- generate_session_id(ws$request)
+
+  # Determine which app this WebSocket is for
+  request_path_validation <- validate_path(ws$request$PATH_INFO)
+  if (!request_path_validation$valid) {
+    logger::log_error("Invalid WebSocket path: {error}", error = request_path_validation$error)
+    ws$close()
+    return()
+  }
+
+  request_path <- request_path_validation$sanitized
+  app_name <- extract_app_name_from_ws_path(request_path, config)
+
+  if (is.null(app_name)) {
+    logger::log_error("Could not determine app for WebSocket connection")
+    ws$close()
+    return()
+  }
+
+  logger::log_info("WebSocket routed to app: {app_name}", app_name = app_name)
+
+  # Start app on demand if it's non-resident and not running
+  app_config <- config$get_app_config(app_name)
+  if (!is.null(app_config) && !app_config$resident && !is.null(process_manager)) {
+    process <- config$get_app_process(app_name)
+    if (is.null(process) || !is_process_alive(process)) {
+      logger::log_info("Starting non-resident app {app_name} on demand for WebSocket connection", app_name = app_name)
+      success <- process_manager$start_app_on_demand(app_name)
+      if (!success) {
+        logger::log_error("Failed to start app {app_name} on demand for WebSocket", app_name = app_name)
+        ws$close()
+        return()
+      }
+    }
+  }
+
+  # Check if app is still starting up
+  if (config$is_app_starting(app_name)) {
+    logger::log_info("App {app_name} is starting, closing WebSocket with retry message", app_name = app_name)
+    ws$send(jsonlite::toJSON(list(
+      error = "App is starting",
+      message = "The application is starting up. Please refresh the page in a few seconds.",
+      retry_after_seconds = 3
+    ), auto_unbox = TRUE))
+    ws$close()
+    return()
+  }
+
+  # Get client connection info
+  client_ip <- get_client_ip(ws$request)
+  user_agent <- ws$request$HTTP_USER_AGENT %||% "unknown"
+
+  # Add connection to manager
+  connection_manager$add_client_connection(session_id, ws, app_name, client_ip, user_agent)
+
+  # Set up message handler
+  ws$onMessage(function(binary, message) {
+    tryCatch(
+      {
+        success <- connection_manager$handle_client_message(session_id, message, app_name)
+        if (!success) {
+          tryCatch(ws$send(jsonlite::toJSON(list(error = "Invalid message"), auto_unbox = TRUE)), error = function(e) {})
+          tryCatch(ws$close(), error = function(e) {})
+        }
+      },
+      error = function(e) {
+        logger::log_error("Error handling WebSocket message: {error}", error = e$message)
+        tryCatch(ws$close(), error = function(e) {})
+      }
+    )
+  })
+
+  # Set up close handler
+  ws$onClose(function() {
+    connection_manager$remove_client_connection(session_id)
+  })
+}
+
+extract_app_name_from_ws_path <- function(request_path, config) {
+  "Extract app name from WebSocket request path
+
+  Returns NULL if app cannot be determined from path.
+  Caller should handle NULL by rejecting the connection with an error.
+  "
+
+  app_name <- NULL
+
+  if (startsWith(request_path, "/proxy/")) {
+    path_parts <- strsplit(request_path, "/")[[1]]
+    path_parts <- path_parts[path_parts != ""]
+    if (length(path_parts) >= 2) {
+      # Validate app name for WebSocket routing
+      app_name_validation <- validate_app_name(path_parts[2])
+      if (app_name_validation$valid) {
+        app_name <- app_name_validation$sanitized
+      }
+    }
+  }
+
+  # Do NOT default to first app - return NULL if routing failed
+  # This prevents silently routing connections to the wrong app
+  return(app_name)
+}

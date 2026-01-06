@@ -1,0 +1,30 @@
+{
+  "apps": [
+    {
+      "name": "sales",
+      "path": "./examples/sales",
+      "resident": true
+    },
+    {
+      "name": "inventory", 
+      "path": "./examples/inventory"
+    },
+    {
+      "name": "reports",
+      "path": "./examples/reports",
+      "resident": false
+    },
+    {
+      "name": "dashboard",
+      "path": "./examples/dashboard",
+      "resident": true
+    }
+  ],
+  "starting_port": 3001,
+  "proxy_port": 3838,
+  "proxy_host": "localhost",
+  "management_port": 3839,
+  "restart_delay": 5,
+  "health_check_interval": 10,
+  "log_dir": "./logs"
+}

@@ -1,0 +1,60 @@
+#' Start Tiny Shiny Server
+#'
+#' Launch the Tiny Shiny Server using a configuration JSON file. This starts
+#' a multi-application Shiny server with automatic health monitoring, session
+#' management, and WebSocket support.
+#'
+#' The server provides:
+#' \itemize{
+#'   \item A proxy server on the configured port (default 3838)
+#'   \item A management interface on the configured port (default 3839)
+#'   \item Automatic port assignment for individual Shiny applications
+#'   \item Health monitoring and automatic restart for failed apps
+#'   \item Support for both resident (always-running) and on-demand apps
+#' }
+#'
+#' @param config Character path to a configuration JSON file. Defaults to
+#'   "config.json" in the current working directory. The configuration file
+#'   should specify apps, ports, and other server settings.
+#'
+#' @return Invisibly returns the TinyShinyServer instance after starting.
+#'   The server runs until interrupted (Ctrl-C) or shut down via the
+#'   management interface.
+#'
+#' @details
+#' The configuration file should contain:
+#' \itemize{
+#'   \item \code{apps}: Array of Shiny applications with name, path, and resident settings
+#'   \item \code{starting_port}: Starting port for auto-assignment to apps
+#'   \item \code{proxy_port}: Port for the main proxy server (default 3838)
+#'   \item \code{management_port}: Port for the management interface (default 3839)
+#'   \item \code{log_dir}: Directory for log files
+#' }
+#'
+#' Access points after starting:
+#' \itemize{
+#'   \item Main landing page: \verb{http://localhost:3838}
+#'   \item Management interface: \verb{http://localhost:3839}
+#'   \item Individual apps: \verb{http://localhost:3838/proxy/{app_name}/}
+#' }
+#'
+#' @examples
+#' if (interactive()) {
+#'   library(tinyshinyserver)
+#'   examples_path <- system.file("examples", package = "tinyshinyserver")
+#'   temp_path <- tempdir()
+#'   file.copy(examples_path, temp_path, recursive = TRUE)
+#'   setwd(temp_path)
+#'   start_tss(config = "examples/config.json")
+#' }
+#'
+#' @export
+start_tss <- function(config = "config.json") {
+  if (!file.exists(config)) {
+    stop(sprintf("Configuration file not found: %s", config))
+  }
+  # Create and start the server
+  server <- TinyShinyServer$new(config)
+  server$start()
+  invisible(server)
+}
