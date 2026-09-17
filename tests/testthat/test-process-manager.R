@@ -1,3 +1,5 @@
+# Keep scheduled process-manager callbacks out of other test files.
+later::with_loop(later::create_loop(), {
 # Test for process management functions
 # Tests for ProcessManager class methods
 
@@ -340,6 +342,7 @@ test_that("restart_app stops existing process and starts new one", {
   writeLines("# placeholder", file.path(temp_app_dir, "app.R"))
 
   config <- ShinyServerConfig$new()
+  on.exit(stop_test_app_processes(config), add = TRUE)
   config$config <- list(
     apps = list(
       list(name = "app1", path = temp_app_dir, port = 3001, resident = TRUE)
@@ -476,6 +479,7 @@ test_that("start_app_on_demand attempts to start app if not running", {
   writeLines("# placeholder", file.path(temp_app_dir, "app.R"))
 
   config <- ShinyServerConfig$new()
+  on.exit(stop_test_app_processes(config), add = TRUE)
   config$config <- list(
     apps = list(
       list(name = "app1", path = temp_app_dir, port = 3001, resident = FALSE)
@@ -764,6 +768,7 @@ test_that("stop_all_apps closes WebSocket handles", {
 
 test_that("health_check removes dead process and cleans connections for resident app", {
   config <- ShinyServerConfig$new()
+  on.exit(stop_test_app_processes(config), add = TRUE)
 
   # Create temp app dir for valid path
   temp_app_dir <- file.path(tempdir(), "health_check_test1")
@@ -839,6 +844,7 @@ test_that("health_check starts missing resident app", {
   writeLines("# placeholder", file.path(temp_app_dir, "app.R"))
 
   config <- ShinyServerConfig$new()
+  on.exit(stop_test_app_processes(config), add = TRUE)
   config$config <- list(
     apps = list(
       list(name = "app1", path = temp_app_dir, port = 3001, resident = TRUE)
@@ -948,16 +954,17 @@ test_that("check_app_ready returns TRUE when port is listening", {
     get_pid = function() 12345,
     is_alive = function() TRUE
   )
+  config$add_app_process("app1", live_process)
   config$set_app_starting("app1")
 
   pm <- ProcessManager$new(config)
 
   local_mocked_bindings(
     is_process_alive = function(process) TRUE,
-    is_port_in_use = function(host, port) TRUE
+    wait_for_backend = function(url, wait_seconds = 0) promises::promise_resolve(TRUE)
   )
 
-  result <- pm$check_app_ready("app1", 3001, live_process)
+  result <- await_response(pm$check_app_ready("app1", 3001, live_process))
 
   expect_true(result)
   # Startup state should be cleared (app is ready)
@@ -972,19 +979,41 @@ test_that("check_app_ready returns FALSE when max attempts exceeded", {
     get_pid = function() 12345,
     is_alive = function() TRUE
   )
+  config$add_app_process("app1", live_process)
   config$set_app_starting("app1")
 
   pm <- ProcessManager$new(config)
 
   local_mocked_bindings(
     is_process_alive = function(process) TRUE,
-    is_port_in_use = function(host, port) FALSE
+    wait_for_backend = function(url, wait_seconds = 0) promises::promise_resolve(FALSE)
   )
 
   # Call with max attempts already reached
-  result <- pm$check_app_ready("app1", 3001, live_process, attempt = 10, max_attempts = 10)
+  result <- await_response(pm$check_app_ready("app1", 3001, live_process, attempt = 10, max_attempts = 10))
 
   expect_false(result)
   # Startup state should be cleared (timed out)
   expect_false(config$is_app_starting("app1"))
+})
+
+test_that("readiness checks continue for apps with a longer appstart_timeout", {
+  config <- ShinyServerConfig$new()
+  config$config <- list(apps = list(list(name = "app1", appstart_timeout = 10)))
+  config$set_app_starting("app1")
+  pm <- ProcessManager$new(config)
+  config$add_app_process("app1", list())
+  local_mocked_bindings(
+    is_process_alive = function(process) TRUE,
+    wait_for_backend = function(url, wait_seconds = 0) promises::promise_resolve(FALSE)
+  )
+  later::with_loop(later::create_loop(), {
+    expect_false(await_response(pm$check_app_ready("app1", 3001, list(), attempt = 10)))
+    expect_true(config$is_app_starting("app1"))
+
+    expect_false(await_response(pm$check_app_ready("app1", 3001, list(), attempt = 20)))
+    expect_false(config$is_app_starting("app1"))
+  })
+})
+
 })

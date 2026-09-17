@@ -4,16 +4,19 @@
 # Process Manager Class
 ProcessManager <- setRefClass("ProcessManager",
   fields = list(
-    config = "ANY"
+    config = "ANY",
+    pending_restarts = "environment"
   ),
   methods = list(
     initialize = function(server_config) {
       config <<- server_config
+      pending_restarts <<- new.env(parent = emptyenv())
     },
     start_app = function(app_config) {
       "Start a Shiny application process"
 
       app_name <- app_config$name
+      assign(app_name, NULL, envir = pending_restarts)
       app_port <- app_config$port
       app_path <- normalizePath(app_config$path, mustWork = FALSE)
 
@@ -158,42 +161,61 @@ ProcessManager <- setRefClass("ProcessManager",
       logger::log_info("App {app_name} process started, checking readiness asynchronously", app_name = app_name)
       return(TRUE)
     },
-    check_app_ready = function(app_name, app_port, process, attempt = 1, max_attempts = 10) {
+    check_app_ready = function(app_name, app_port, process, attempt = 1, max_attempts = NULL) {
       "Check if app is ready to accept connections (async, non-blocking)"
+
+      if (is.null(max_attempts)) {
+        app_config <- config$get_app_config(app_name)
+        max_attempts <- max(10, ceiling((app_config$appstart_timeout %||% 2) / 0.5))
+      }
+
+      # Ignore callbacks from stopped or replaced process generations.
+      if (!identical(config$get_app_process(app_name), process)) return(FALSE)
 
       # Check if process is still alive
       if (!is_process_alive(process)) {
         logger::log_error("App {app_name} process died during startup", app_name = app_name)
+        if (!kill_process_safely(process)) return(FALSE)
         config$set_app_ready(app_name) # Remove startup state
         config$remove_app_process(app_name)
         return(FALSE)
       }
 
-      # Check if port has a process listening (app is ready)
-      if (is_port_in_use("127.0.0.1", app_port)) {
-        logger::log_info("App {app_name} is ready on port {port} (attempt {attempt})",
-          app_name = app_name, port = app_port, attempt = attempt
-        )
-        config$set_app_ready(app_name) # Mark as ready
-        return(TRUE)
-      }
+      # Use the same nonblocking TCP probe as HTTP startup requests.
+      tracked_process <- config$get_app_process(app_name)
+      return(promises::then(wait_for_backend(paste0("http://127.0.0.1:", app_port)), function(ready) {
+        # A replacement may have been registered while the probe was pending.
+        if (!identical(config$get_app_process(app_name), tracked_process)) return(FALSE)
+        if (ready) {
+          logger::log_info("App {app_name} is ready on port {port} (attempt {attempt})",
+            app_name = app_name, port = app_port, attempt = attempt
+          )
+          config$set_app_ready(app_name) # Mark as ready
+          return(TRUE)
+        }
 
-      # If not ready and haven't exceeded max attempts, schedule another check
-      if (attempt < max_attempts) {
-        later::later(function() {
-          check_app_ready(app_name, app_port, process, attempt + 1, max_attempts)
-        }, delay = 0.5)
-        logger::log_debug("App {app_name} not ready yet, will retry (attempt {attempt}/{max})",
-          app_name = app_name, attempt = attempt, max = max_attempts
-        )
-      } else {
-        logger::log_error("App {app_name} failed to become ready after {max} attempts",
-          app_name = app_name, max = max_attempts
-        )
-        config$set_app_ready(app_name) # Remove startup state (timed out)
-      }
+        # If not ready and haven't exceeded max attempts, schedule another check
+        if (attempt < max_attempts) {
+          later::later(function() {
+            check_app_ready(app_name, app_port, process, attempt + 1, max_attempts)
+          }, delay = 0.5)
+          logger::log_debug("App {app_name} not ready yet, will retry (attempt {attempt}/{max})",
+            app_name = app_name, attempt = attempt, max = max_attempts
+          )
+        } else {
+          logger::log_error("App {app_name} failed to become ready after {max} attempts",
+            app_name = app_name, max = max_attempts
+          )
+          config$set_app_ready(app_name) # Remove startup state (timed out)
+        }
 
-      return(FALSE)
+        return(FALSE)
+      }, onRejected = function(e) {
+        logger::log_error("Readiness check failed for {app_name}: {error}",
+          app_name = app_name, error = conditionMessage(e)
+        )
+        FALSE
+      }))
     },
     start_app_on_demand = function(app_name) {
       "Start a non-resident app on demand if not already running"
@@ -209,6 +231,13 @@ ProcessManager <- setRefClass("ProcessManager",
       if (!is.null(process) && is_process_alive(process)) {
         logger::log_debug("App {app_name} already running on demand", app_name = app_name)
         return(TRUE)
+      }
+
+      # Retain ownership of a crashed process until its workers are terminated.
+      if (!is.null(process)) {
+        if (!kill_process_safely(process)) return(FALSE)
+        cleanup_app_connections(app_name)
+        config$remove_app_process(app_name)
       }
 
       # Check if app is currently starting
@@ -229,6 +258,38 @@ ProcessManager <- setRefClass("ProcessManager",
 
       return(success)
     },
+    schedule_restart = function(app_config) {
+      "Schedule a replacement without blocking other applications"
+      app_name <- app_config$name
+      token <- new.env(parent = emptyenv())
+      assign(app_name, token, envir = pending_restarts)
+      restart <- function() {
+        if (!identical(pending_restarts[[app_name]], token)) return(FALSE)
+        assign(app_name, NULL, envir = pending_restarts)
+        process <- config$get_app_process(app_name)
+        if (!is.null(process) && is_process_alive(process)) return(FALSE)
+        tryCatch({
+          success <- start_app(app_config)
+          if (isTRUE(success) && !app_config$resident) {
+            # A restart disconnects users; reclaim the replacement if none return.
+            # Allow startup time as well as the normal browser-session grace.
+            create_connection_manager(config, .self)$schedule_session_check(app_name,
+              (app_config$appstart_timeout %||% 2) + config$HTTP_SESSION_GRACE_SECONDS)
+          }
+          success
+        }, error = function(e) {
+          logger::log_error("Failed to restart app {app_name}: {error}", app_name = app_name, error = e$message)
+          FALSE
+        })
+      }
+      delay <- config$config$restart_delay %||% 5
+      if (delay <= 0) {
+        success <- isTRUE(restart())
+        return(list(success = success, message = if (success) paste("App", app_name, "restarted successfully") else paste("Failed to restart app", app_name)))
+      }
+      later::later(restart, delay)
+      list(success = TRUE, message = paste("Restart scheduled for app", app_name))
+    },
     restart_app = function(app_name) {
       "Restart a specific application"
 
@@ -246,18 +307,13 @@ ProcessManager <- setRefClass("ProcessManager",
 
           # Stop existing process
           process <- config$get_app_process(app_name)
-          if (!is.null(process) && is_process_alive(process)) {
-            kill_process_safely(process)
+          if (!is.null(process)) {
+            if (!kill_process_safely(process)) {
+              return(list(success = FALSE, message = paste("Failed to stop app", app_name)))
+            }
           }
           config$remove_app_process(app_name)
-
-          # Wait a moment before restarting
-          Sys.sleep(config$config$restart_delay %||% 5)
-
-          # Start new process
-          start_app(app_config)
-
-          return(list(success = TRUE, message = paste("App", app_name, "restarted successfully")))
+          return(schedule_restart(app_config))
         },
         error = function(e) {
           logger::log_error("Failed to restart app {app_name}: {error}", app_name = app_name, error = e$message)
@@ -269,13 +325,13 @@ ProcessManager <- setRefClass("ProcessManager",
       "Stop a specific application"
 
       logger::log_info("Stopping app: {app_name}", app_name = app_name)
+      assign(app_name, NULL, envir = pending_restarts)
 
       process <- config$get_app_process(app_name)
       if (!is.null(process)) {
         success <- kill_process_safely(process)
-        config$remove_app_process(app_name)
-
         if (success) {
+          config$remove_app_process(app_name)
           logger::log_info("Successfully stopped app {app_name}", app_name = app_name)
           return(list(success = TRUE, message = paste("App", app_name, "stopped successfully")))
         } else {
@@ -309,35 +365,41 @@ ProcessManager <- setRefClass("ProcessManager",
 
       for (app_config in config$config$apps) {
         app_name <- app_config$name
-        process <- config$get_app_process(app_name)
+        if (!is.null(pending_restarts[[app_name]])) next
+        tryCatch({
+          process <- config$get_app_process(app_name)
 
-        if (!is.null(process)) {
-          if (!is_process_alive(process)) {
-            logger::log_error("App {app_name} died, restarting", app_name = app_name)
+          if (!is.null(process)) {
+            if (!is_process_alive(process)) {
+              logger::log_error("App {app_name} died, restarting", app_name = app_name)
+              if (!kill_process_safely(process)) next
 
-            # Clean up connections for this app
-            cleanup_app_connections(app_name)
+              # Clean up connections for this app
+              cleanup_app_connections(app_name)
 
-            # Remove dead process
-            config$remove_app_process(app_name)
+              # Remove dead process
+              config$remove_app_process(app_name)
 
-            # Only restart if it's a resident app
+              # Only restart if it's a resident app
+              if (app_config$resident) {
+                schedule_restart(app_config)
+              } else {
+                logger::log_info("Non-resident app {app_name} died, will start on next request", app_name = app_name)
+              }
+            }
+          } else {
+            # App not running - only start if it's resident
             if (app_config$resident) {
-              Sys.sleep(config$config$restart_delay %||% 5)
+              logger::log_info("Resident app {app_name} not running, starting", app_name = app_name)
               start_app(app_config)
             } else {
-              logger::log_info("Non-resident app {app_name} died, will start on next request", app_name = app_name)
+              logger::log_debug("Non-resident app {app_name} is stopped (normal state)", app_name = app_name)
             }
           }
-        } else {
-          # App not running - only start if it's resident
-          if (app_config$resident) {
-            logger::log_info("Resident app {app_name} not running, starting", app_name = app_name)
-            start_app(app_config)
-          } else {
-            logger::log_debug("Non-resident app {app_name} is stopped (normal state)", app_name = app_name)
-          }
-        }
+        }, error = function(e) {
+          logger::log_error("Health check failed for app {app_name}: {error}",
+            app_name = app_name, error = conditionMessage(e))
+        })
       }
     },
     cleanup_app_connections = function(app_name) {
@@ -399,13 +461,16 @@ ProcessManager <- setRefClass("ProcessManager",
                 session_id = session_id, time = format(conn_info$last_activity)
               )
 
-              if (!is.null(conn_info$ws)) {
-                tryCatch(conn_info$ws$close(), error = function(e) {
-                  logger::log_debug("Error closing backend ws: {error}", error = e$message)
-                })
+              if (!is.null(config$get_ws_connection(session_id))) {
+                create_connection_manager(config, .self)$close_client_connection(session_id)
+              } else {
+                config$remove_backend_connection(session_id)
+                if (!is.null(conn_info$ws)) {
+                  tryCatch(conn_info$ws$close(), error = function(e) {
+                    logger::log_debug("Error closing backend ws: {error}", error = e$message)
+                  })
+                }
               }
-
-              config$remove_backend_connection(session_id)
               connections_cleaned <- connections_cleaned + 1
             }
           },
@@ -436,11 +501,9 @@ ProcessManager <- setRefClass("ProcessManager",
                 time = format(conn_info$last_activity)
               )
 
-              # Use idempotent remove (safe if already removed by callback)
-              result <- config$remove_ws_connection(session_id)
-              if (result) {
-                connections_cleaned <- connections_cleaned + 1
-              }
+              # Close both sockets and run the normal idle-app cleanup path.
+              create_connection_manager(config, .self)$close_client_connection(session_id)
+              connections_cleaned <- connections_cleaned + 1
             }
           },
           error = function(e) {
@@ -483,6 +546,7 @@ ProcessManager <- setRefClass("ProcessManager",
 
             if (!is_process_alive(process)) {
               logger::log_info("Cleaning dead process for app {app_name}", app_name = app_name)
+              if (!kill_process_safely(process)) next
               config$remove_app_process(app_name)
               processes_cleaned <- processes_cleaned + 1
 
@@ -561,6 +625,7 @@ ProcessManager <- setRefClass("ProcessManager",
     },
     stop_all_apps = function() {
       "Stop all running applications and clean up all connections"
+      pending_restarts <<- new.env(parent = emptyenv())
 
       logger::log_info("Stopping all applications...")
 

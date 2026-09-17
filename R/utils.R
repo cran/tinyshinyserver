@@ -174,22 +174,19 @@ is_process_alive <- function(process) {
 kill_process_safely <- function(process, force = FALSE) {
   "Safely terminate a process"
 
-  if (is.null(process) || !is_process_alive(process)) {
+  if (is.null(process)) {
     return(TRUE)
   }
 
   tryCatch(
     {
-      if (force) {
-        process$kill_tree()
-      } else {
-        process$kill()
-        Sys.sleep(1)
-        if (is_process_alive(process)) {
-          process$kill_tree()
-        }
-      }
-      return(TRUE)
+      # processx tracks descendants by inherited markers, even after parent exit.
+      if (is.function(process$kill_tree)) process$kill_tree()
+      if (!force && is_process_alive(process)) process$kill()
+      # Signal delivery can precede process exit, particularly on macOS.
+      # Wait briefly for termination, but still report a surviving process.
+      if (is.function(process$wait)) process$wait(timeout = 1000)
+      return(!is_process_alive(process))
     },
     error = function(e) {
       logger::log_error("Error terminating process: {error}", error = e$message)
@@ -286,7 +283,9 @@ is_port_in_use <- function(host, port) {
   tryCatch(
     {
       # Try to establish a connection to the port
-      conn <- socketConnection(host = host, port = port, timeout = 1, blocking = TRUE)
+      conn <- suppressWarnings(
+        socketConnection(host = host, port = port, timeout = 1, blocking = TRUE)
+      )
       close(conn)
       return(TRUE) # Connection succeeded = port is in use
     },

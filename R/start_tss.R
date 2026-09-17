@@ -4,34 +4,20 @@
 #' a multi-application Shiny server with automatic health monitoring, session
 #' management, and WebSocket support.
 #'
-#' The server provides:
-#' \itemize{
-#'   \item A proxy server on the configured port (default 3838)
-#'   \item A management interface on the configured port (default 3839)
-#'   \item Automatic port assignment for individual Shiny applications
-#'   \item Health monitoring and automatic restart for failed apps
-#'   \item Support for both resident (always-running) and on-demand apps
-#' }
-#'
 #' @param config Character path to a configuration JSON file. Defaults to
 #'   "config.json" in the current working directory. The configuration file
 #'   should specify apps, ports, and other server settings.
 #'
-#' @return Invisibly returns the TinyShinyServer instance after starting.
-#'   The server runs until interrupted (Ctrl-C) or shut down via the
+#' @return Invisibly returns the TinyShinyServer instance after the server stops.
+#'   This function blocks until interrupted (Ctrl-C) or shut down via the
 #'   management interface.
 #'
 #' @details
-#' The configuration file should contain:
-#' \itemize{
-#'   \item \code{apps}: Array of Shiny applications with name, path, and resident settings
-#'   \item \code{starting_port}: Starting port for auto-assignment to apps
-#'   \item \code{proxy_port}: Port for the main proxy server (default 3838)
-#'   \item \code{management_port}: Port for the management interface (default 3839)
-#'   \item \code{log_dir}: Directory for log files
-#' }
+#' See \code{\link{config-format}} for required fields, defaults, app lifecycle
+#' settings, and port assignment. Relative app paths and the log directory are
+#' resolved from the R working directory, not the configuration file's directory.
 #'
-#' Access points after starting:
+#' Access points with the default ports:
 #' \itemize{
 #'   \item Main landing page: \verb{http://localhost:3838}
 #'   \item Management interface: \verb{http://localhost:3839}
@@ -40,12 +26,18 @@
 #'
 #' @examples
 #' if (interactive()) {
-#'   library(tinyshinyserver)
-#'   examples_path <- system.file("examples", package = "tinyshinyserver")
-#'   temp_path <- tempdir()
-#'   file.copy(examples_path, temp_path, recursive = TRUE)
-#'   setwd(temp_path)
-#'   start_tss(config = "examples/config.json")
+#'   (function() {
+#'     example_dir <- tempfile("tss-example-")
+#'     dir.create(example_dir)
+#'     old_dir <- setwd(example_dir)
+#'     on.exit({
+#'       setwd(old_dir)
+#'       unlink(example_dir, recursive = TRUE)
+#'     }, add = TRUE)
+#'     examples_path <- system.file("examples", package = "tinyshinyserver")
+#'     file.copy(examples_path, ".", recursive = TRUE)
+#'     start_tss(config = "examples/config.json")
+#'   })()
 #' }
 #'
 #' @export

@@ -17,6 +17,9 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
     # Validation: validate_connection_count_consistency() detects/fixes corruption
     # Benchmark: tests/benchmark_connection_count.R shows performance gains
     app_connection_counts = "environment",
+    active_http_requests = "environment",
+    deferred_idle_stops = "environment",
+    pending_session_checks = "environment",
     app_startup_state = "environment", # Track app startup progress (starting/ready)
     management_server = "ANY",
 
@@ -28,7 +31,8 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
     MAX_QUERY_LENGTH = "numeric",
     MAX_MESSAGE_SIZE = "numeric",
     ALLOWED_HTTP_METHODS = "character",
-    APP_STARTUP_TIMEOUT_SECONDS = "numeric"
+    APP_STARTUP_TIMEOUT_SECONDS = "numeric",
+    HTTP_SESSION_GRACE_SECONDS = "numeric"
   ),
   methods = list(
     initialize = function() {
@@ -41,12 +45,16 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
       MAX_MESSAGE_SIZE <<- 1048576
       ALLOWED_HTTP_METHODS <<- c("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS")
       APP_STARTUP_TIMEOUT_SECONDS <<- 30
+      HTTP_SESSION_GRACE_SECONDS <<- 30
 
       # Initialize runtime state
       app_processes <<- list()
       ws_connections <<- list()
       backend_connections <<- list()
       app_connection_counts <<- new.env(hash = TRUE, parent = emptyenv())
+      active_http_requests <<- new.env(hash = TRUE, parent = emptyenv())
+      deferred_idle_stops <<- new.env(hash = TRUE, parent = emptyenv())
+      pending_session_checks <<- new.env(hash = TRUE, parent = emptyenv())
       app_startup_state <<- new.env(hash = TRUE, parent = emptyenv())
       management_server <<- NULL
 
@@ -85,6 +93,7 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
 
       # Set default values for optional app fields
       for (i in seq_along(config$apps)) {
+        config$apps[[i]]$appstart_timeout <<- config$apps[[i]]$appstart_timeout %||% 2
         if (!"resident" %in% names(config$apps[[i]])) {
           config$apps[[i]]$resident <<- FALSE
         }
@@ -110,19 +119,31 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
         }
       }
 
-      # Validate starting_port (now required)
-      if (!is.numeric(config$starting_port) || length(config$starting_port) != 1 ||
-        config$starting_port < 1 || config$starting_port > 65535) {
-        return(list(valid = FALSE, error = "Invalid starting_port: must be a number between 1 and 65535"))
+      # Validate all configured ports before using them in allocation arithmetic.
+      for (field in intersect(c("starting_port", "proxy_port", "management_port"), names(config))) {
+        port_validation <- validate_port(config[[field]])
+        if (!port_validation$valid) {
+          return(list(valid = FALSE, error = paste0("Invalid ", field, ": ", port_validation$error)))
+        }
+      }
+
+      # Validate timer values before they reach the event-loop scheduler.
+      for (field in intersect(c("restart_delay", "health_check_interval"), names(config))) {
+        value <- config[[field]]
+        positive <- field == "health_check_interval"
+        if (!is.numeric(value) || length(value) != 1 || !is.finite(value) ||
+          value < 0 || (positive && value == 0)) {
+          bound <- if (positive) "positive" else "non-negative"
+          return(list(valid = FALSE, error = paste(field, "must be a single", bound, "finite number of seconds")))
+        }
       }
 
       # Check if there's enough port range for all apps
       num_apps <- length(config$apps)
-      reserved_ports <- c()
-      if ("proxy_port" %in% names(config)) reserved_ports <- c(reserved_ports, config$proxy_port)
-      if ("management_port" %in% names(config)) reserved_ports <- c(reserved_ports, config$management_port)
+      reserved_ports <- unique(c(config$proxy_port %||% 3838, config$management_port %||% 3839))
+      reserved_ports <- reserved_ports[reserved_ports >= config$starting_port & reserved_ports <= 65535]
 
-      # Calculate maximum port that might be needed
+      # Only reserved ports in the remaining allocation range consume capacity.
       max_possible_port <- config$starting_port + num_apps - 1 + length(reserved_ports)
       if (max_possible_port > 65535) {
         return(list(valid = FALSE, error = sprintf(
@@ -136,6 +157,7 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
         return(list(valid = FALSE, error = "Apps must be a non-empty list"))
       }
 
+      app_names <- character()
       # Validate each app configuration
       for (i in seq_along(config$apps)) {
         app <- config$apps[[i]]
@@ -149,6 +171,13 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
         for (field in app_required) {
           if (!field %in% names(app)) {
             return(list(valid = FALSE, error = paste("App", i, "missing field:", field)))
+          }
+        }
+
+        if ("appstart_timeout" %in% names(app)) {
+          if (!is.numeric(app$appstart_timeout) || length(app$appstart_timeout) != 1 ||
+            !is.finite(app$appstart_timeout) || app$appstart_timeout <= 0) {
+            return(list(valid = FALSE, error = paste("App", i, "appstart_timeout must be a single positive finite number of seconds")))
           }
         }
 
@@ -172,6 +201,11 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
           return(list(valid = FALSE, error = paste("App", i, "name too long")))
         }
 
+        if (app$name %in% app_names) {
+          return(list(valid = FALSE, error = paste("Duplicate app name:", app$name)))
+        }
+        app_names <- c(app_names, app$name)
+
         # Validate path
         if (!is.character(app$path) || length(app$path) != 1) {
           return(list(valid = FALSE, error = paste("App", i, "path must be a string")))
@@ -179,13 +213,6 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
       }
 
       # Validate optional fields
-      if ("proxy_port" %in% names(config)) {
-        if (!is.numeric(config$proxy_port) || length(config$proxy_port) != 1 ||
-          config$proxy_port < 1 || config$proxy_port > 65535) {
-          return(list(valid = FALSE, error = "Invalid proxy_port"))
-        }
-      }
-
       if ("proxy_host" %in% names(config)) {
         if (!is.character(config$proxy_host) || length(config$proxy_host) != 1) {
           return(list(valid = FALSE, error = "proxy_host must be a string"))
@@ -238,6 +265,8 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
     remove_app_process = function(app_name) {
       "Remove a process from tracking"
       app_processes[[app_name]] <<- NULL
+      # Startup state belongs to the removed process generation.
+      set_app_ready(app_name)
     },
     get_app_process = function(app_name) {
       "Get a tracked process by app name"
@@ -600,7 +629,9 @@ ShinyServerConfig <- setRefClass("ShinyServerConfig",
         elapsed <- as.numeric(difftime(Sys.time(), startup_info$started_at,
           units = "secs"
         ))
-        if (elapsed > APP_STARTUP_TIMEOUT_SECONDS) {
+        app_config <- get_app_config(app_name)
+        startup_timeout <- max(APP_STARTUP_TIMEOUT_SECONDS, app_config$appstart_timeout %||% 0)
+        if (elapsed > startup_timeout) {
           # Startup timed out, remove state
           rm(list = app_name, envir = app_startup_state)
           return(list(state = "timeout", elapsed = elapsed))

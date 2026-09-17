@@ -21,13 +21,28 @@ ConnectionManager <- setRefClass("ConnectionManager",
         return(NULL)
       }
 
-      backend_url <- paste0("ws://127.0.0.1:", app_config$port, "/websocket/")
+      backend_path <- "/websocket/"
+      client_path <- client_ws$request$PATH_INFO
+      prefix <- paste0("/proxy/", app_name)
+      if (!is.null(client_path) && startsWith(client_path, paste0(prefix, "/"))) {
+        backend_path <- substring(client_path, nchar(prefix) + 1L)
+      }
+      backend_query <- client_ws$request$QUERY_STRING %||% ""
+      if (backend_query != "" && !startsWith(backend_query, "?")) {
+        backend_query <- paste0("?", backend_query)
+      }
+      backend_url <- paste0("ws://127.0.0.1:", app_config$port, backend_path, backend_query)
       logger::log_info("Connecting to backend: {backend_url} for app {app_name}",
         backend_url = backend_url, app_name = app_name
       )
 
       # Create WebSocket connection to backend
-      backend_ws <- websocket::WebSocket$new(backend_url)
+      headers <- list()
+      for (name in c("Cookie", "Authorization")) {
+        value <- client_ws$request[[paste0("HTTP_", toupper(name))]]
+        if (!is.null(value)) headers[[name]] <- value
+      }
+      backend_ws <- websocket::WebSocket$new(backend_url, headers = headers)
 
       # Store connection info with ready state and timestamp
       config$add_backend_connection(session_id, list(
@@ -43,8 +58,16 @@ ConnectionManager <- setRefClass("ConnectionManager",
       # Handle messages from backend to client
       backend_ws$onMessage(function(event) {
         logger::log_debug("Backend->Client message for {app_name}: {data}",
-          app_name = app_name, data = substring(event$data, 1, 100)
+          app_name = app_name, data = if (is.raw(event$data)) paste(length(event$data), "binary bytes") else substring(event$data, 1, 100)
         )
+        conn <- config$get_backend_connection(session_id)
+        if (is.null(conn) || !identical(conn$ws, backend_ws)) return()
+        conn$last_activity <- Sys.time()
+        config$add_backend_connection(session_id, conn)
+        client <- config$get_ws_connection(session_id)
+        if (is.null(client)) return()
+        client$last_activity <- conn$last_activity
+        config$add_ws_connection(session_id, client)
         client_ws$send(event$data)
       })
 
@@ -75,13 +98,19 @@ ConnectionManager <- setRefClass("ConnectionManager",
 
       backend_ws$onClose(function(event) {
         logger::log_info("Backend connection closed for app {app_name}", app_name = app_name)
+        conn <- config$get_backend_connection(session_id)
+        if (is.null(conn) || !identical(conn$ws, backend_ws)) return()
         config$remove_backend_connection(session_id)
+        close_client_connection(session_id)
       })
 
       backend_ws$onError(function(event) {
         logger::log_error("Backend connection error for app {app_name}: {error}",
           app_name = app_name, error = event$message
         )
+        conn <- config$get_backend_connection(session_id)
+        if (is.null(conn) || !identical(conn$ws, backend_ws)) return()
+        close_client_connection(session_id)
       })
 
       return(backend_ws)
@@ -97,7 +126,8 @@ ConnectionManager <- setRefClass("ConnectionManager",
       }
       validated_message <- message_validation$sanitized
 
-      logger::log_debug("Client message: {message}", message = substring(validated_message, 1, 100))
+      logger::log_debug("Client message: {message}",
+        message = if (is.raw(validated_message)) paste(length(validated_message), "binary bytes") else substring(validated_message, 1, 100))
 
       # Update last activity timestamp
       conn_info <- config$get_ws_connection(session_id)
@@ -131,7 +161,7 @@ ConnectionManager <- setRefClass("ConnectionManager",
                   current_pending <- tail(current_pending, config$MAX_PENDING_MESSAGES - 1)
                   logger::log_warn("Pending queue full, dropped oldest messages for app {app_name}", app_name = app_name)
                 }
-                backend_conn$pending_messages <- append(current_pending, validated_message)
+                backend_conn$pending_messages <- append(current_pending, list(validated_message))
                 config$add_backend_connection(session_id, backend_conn)
                 logger::log_debug("Queued message for pending connection ({count}/{max}) for app {app_name}",
                   count = length(current_pending) + 1, max = config$MAX_PENDING_MESSAGES, app_name = app_name
@@ -149,6 +179,8 @@ ConnectionManager <- setRefClass("ConnectionManager",
     },
     add_client_connection = function(session_id, ws, app_name, client_ip, user_agent) {
       "Add a new client WebSocket connection"
+      assign(app_name, NULL, envir = config$deferred_idle_stops)
+      assign(app_name, NULL, envir = config$pending_session_checks)
 
       config$add_ws_connection(session_id, list(
         ws = ws,
@@ -162,6 +194,15 @@ ConnectionManager <- setRefClass("ConnectionManager",
       logger::log_info("WebSocket connection added for app {app_name} from {client_ip}",
         app_name = app_name, client_ip = client_ip
       )
+    },
+    close_client_connection = function(session_id) {
+      "Close a client socket and idempotently clean up its session"
+      conn <- config$get_ws_connection(session_id)
+      # Remove tracking before closing sockets: close callbacks may run inline.
+      remove_client_connection(session_id)
+      if (!is.null(conn$ws)) {
+        tryCatch(conn$ws$close(), error = function(e) {})
+      }
     },
     remove_client_connection = function(session_id) {
       "Remove a client WebSocket connection and cleanup"
@@ -183,10 +224,10 @@ ConnectionManager <- setRefClass("ConnectionManager",
       # Clean up backend connection
       backend_conn <- config$get_backend_connection(session_id)
       if (!is.null(backend_conn)) {
+        config$remove_backend_connection(session_id)
         if (!is.null(backend_conn$ws)) {
           tryCatch(backend_conn$ws$close(), error = function(e) {})
         }
-        config$remove_backend_connection(session_id)
       }
     },
     get_connection_stats = function() {
@@ -211,6 +252,44 @@ ConnectionManager <- setRefClass("ConnectionManager",
         connections_by_app = app_connections
       ))
     },
+    begin_http_request = function(app_name) {
+      assign(app_name, NULL, envir = config$pending_session_checks)
+      count <- config$active_http_requests[[app_name]] %||% 0L
+      assign(app_name, count + 1L, envir = config$active_http_requests)
+    },
+    end_http_request = function(app_name) {
+      count <- max(0L, (config$active_http_requests[[app_name]] %||% 0L) - 1L)
+      assign(app_name, count, envir = config$active_http_requests)
+      pending <- config$deferred_idle_stops[[app_name]]
+      if (count == 0L && !is.null(pending)) {
+        assign(app_name, NULL, envir = config$deferred_idle_stops)
+        # Completion of an old request must never stop a replacement process.
+        if (identical(config$get_app_process(app_name), pending$process)) {
+          # The response may be a new page whose WebSocket has not opened yet.
+          schedule_session_check(app_name)
+        }
+      } else if (count == 0L) {
+        schedule_session_check(app_name)
+      }
+    },
+    schedule_session_check = function(app_name, grace_seconds = config$HTTP_SESSION_GRACE_SECONDS) {
+      "Reclaim an HTTP-only launch after allowing time for a browser session"
+      app_config <- config$get_app_config(app_name)
+      process <- config$get_app_process(app_name)
+      if (is.null(process_manager) || is.null(app_config) || app_config$resident ||
+          is.null(process) || config$get_app_connection_count(app_name) > 0L) return(FALSE)
+      token <- new.env(parent = emptyenv())
+      assign(app_name, token, envir = config$pending_session_checks)
+      later::later(function() {
+        if (!identical(config$pending_session_checks[[app_name]], token)) return(FALSE)
+        assign(app_name, NULL, envir = config$pending_session_checks)
+        if (!identical(config$get_app_process(app_name), process) ||
+            (config$active_http_requests[[app_name]] %||% 0L) > 0L ||
+            config$get_app_connection_count(app_name) > 0L) return(FALSE)
+        maybe_stop_idle_app(app_name)
+      }, grace_seconds)
+      TRUE
+    },
     maybe_stop_idle_app = function(app_name) {
       "Stop on-demand app if it has no active connections"
 
@@ -229,6 +308,11 @@ ConnectionManager <- setRefClass("ConnectionManager",
       if (ws_count == 0 && !is.null(process_manager)) {
         app_config <- config$get_app_config(app_name)
         if (!is.null(app_config) && !app_config$resident) {
+          if ((config$active_http_requests[[app_name]] %||% 0L) > 0L) {
+            assign(app_name, list(process = config$get_app_process(app_name)), envir = config$deferred_idle_stops)
+            return(TRUE)
+          }
+          assign(app_name, NULL, envir = config$deferred_idle_stops)
           logger::log_info("No WebSocket connections remain for non-resident app {app_name}, stopping immediately", app_name = app_name)
           process_manager$stop_app_immediately(app_name)
         }

@@ -473,8 +473,8 @@ test_that("handle_proxy_request starts non-resident app on demand", {
 
   req <- list()
 
-  # This will try to start the app but fail when proxying
-  result <- handle_proxy_request("/proxy/myapp/", "GET", NULL, req, config, mock_pm)
+  local_mocked_bindings(wait_for_backend = function(url, wait_seconds) promises::promise_resolve(FALSE))
+  result <- await_response(handle_proxy_request("/proxy/myapp/", "GET", NULL, req, config, mock_pm))
 
   # App start should have been called
   expect_true(start_called)
@@ -507,19 +507,9 @@ test_that("handle_proxy_request returns 502 when app fails to start", {
 test_that("forward_request returns 503 for starting apps", {
   config <- ShinyServerConfig$new()
   config$config <- list(apps = list())
-
-  # Mark app as starting
   config$set_app_starting("testapp")
-
-  req <- list()
-
-  # Mock is_port_in_use to return FALSE (app not ready)
-  local_mocked_bindings(
-    is_port_in_use = function(host, port) FALSE
-  )
-
-  result <- forward_request("GET", "http://127.0.0.1:3001/", req, "testapp", config)
-
+  local_mocked_bindings(wait_for_backend = function(url, wait_seconds) promises::promise_resolve(FALSE))
+  result <- await_response(forward_request("GET", "http://127.0.0.1:3001/", list(), "testapp", config))
   expect_equal(result$status, 503)
   expect_match(result$body, "starting up")
   expect_true("Retry-After" %in% names(result$headers))
@@ -528,33 +518,18 @@ test_that("forward_request returns 503 for starting apps", {
 test_that("forward_request returns 502 for timed out startups", {
   config <- ShinyServerConfig$new()
   config$config <- list(apps = list())
-
-  # Manually create a timed out startup state
   assign("testapp", list(
-    state = "starting",
-    started_at = Sys.time() - (config$APP_STARTUP_TIMEOUT_SECONDS + 5)
+    state = "starting", started_at = Sys.time() - (config$APP_STARTUP_TIMEOUT_SECONDS + 5)
   ), envir = config$app_startup_state)
-
-  req <- list()
-
-  result <- forward_request("GET", "http://127.0.0.1:3001/", req, "testapp", config)
-
+  result <- forward_request("GET", "http://127.0.0.1:3001/", list(), "testapp", config)
   expect_equal(result$status, 502)
   expect_match(result$body, "timed out")
 })
 
-test_that("forward_request returns 503 when port not in use", {
+test_that("forward_request returns 503 when backend is unavailable", {
   config <- ShinyServerConfig$new()
-  config$config <- list(apps = list())
-
-  req <- list()
-
-  local_mocked_bindings(
-    is_port_in_use = function(host, port) FALSE
-  )
-
-  result <- forward_request("GET", "http://127.0.0.1:3001/", req, "testapp", config)
-
+  local_mocked_bindings(wait_for_backend = function(url, wait_seconds) promises::promise_resolve(FALSE))
+  result <- await_response(forward_request("GET", "http://127.0.0.1:3001/", list(), "testapp", config))
   expect_equal(result$status, 503)
   expect_match(result$body, "not ready")
 })
@@ -599,16 +574,54 @@ test_that("route_http_request routes proxy requests correctly", {
     )
   )
   template_manager <- create_mock_template_manager()
-  connection_manager <- create_mock_connection_manager()
+  connection_manager <- ConnectionManager$new(config)
 
   req <- list(process_manager = NULL, connection_manager = connection_manager)
 
-  # Without a running app, this should return 503
+  # Without a running app, this should return 503.
   local_mocked_bindings(
-    is_port_in_use = function(host, port) FALSE
+    wait_for_backend = function(url, wait_seconds) promises::promise_resolve(FALSE)
   )
 
-  result <- route_http_request("/proxy/testapp/", "GET", NULL, req, config, template_manager, connection_manager)
+  result <- await_response(route_http_request("/proxy/testapp/", "GET", NULL, req, config, template_manager, connection_manager))
 
   expect_equal(result$status, 503)
+})
+
+test_that("forward_request honors each app's startup grace period", {
+  for (case in list(
+    list(timeout = NULL, elapsed = 3, polls = FALSE),
+    list(timeout = 10, elapsed = 3, polls = TRUE),
+    list(timeout = 0.5, elapsed = 1, polls = FALSE),
+    list(timeout = 60, elapsed = 35, polls = TRUE)
+  )) {
+    config <- ShinyServerConfig$new()
+    config$config <- list(apps = list(list(name = "app", appstart_timeout = case$timeout)))
+    assign("app", list(state = "starting", started_at = Sys.time() - case$elapsed),
+      envir = config$app_startup_state)
+    waits <- numeric()
+    with_mocked_bindings(
+      wait_for_backend = function(url, wait_seconds) {
+        waits <<- c(waits, wait_seconds)
+        promises::promise_resolve(TRUE)
+      },
+      fetch_backend_async = function(url, handle) promises::promise_resolve(list(
+        status_code = 200L, headers = charToRaw("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"),
+        content = charToRaw("ready")
+      )),
+      {
+        result <- await_response(forward_request("GET", "http://127.0.0.1:3001/", list(), "app", config))
+        if (case$polls) {
+          expect_equal(result$status, 200)
+          expect_null(config$get_app_startup_state("app"))
+          expect_length(waits, 1)
+          expect_equal(waits, case$timeout - case$elapsed, tolerance = 0.1)
+        } else {
+          expect_equal(result$status, 503)
+          expect_match(result$body, "starting up")
+          expect_length(waits, 0)
+        }
+      }
+    )
+  }
 })

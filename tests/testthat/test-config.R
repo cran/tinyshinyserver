@@ -966,3 +966,73 @@ test_that("validate_port_assignments detects conflict with management port", {
     "Port conflict"
   )
 })
+
+test_that("scheduler settings reject invalid delays before startup", {
+  config <- ShinyServerConfig$new()
+  base <- list(apps = list(list(name = "app", path = "/tmp/app")),
+    log_dir = "/tmp/logs", starting_port = 5001)
+  for (field in c("restart_delay", "health_check_interval")) {
+    for (value in list(-1, Inf, -Inf, NA_real_, NaN, "10", TRUE, NULL, numeric(), c(1, 2))) {
+      candidate <- base
+      candidate[field] <- list(value)
+      result <- config$validate_config(candidate)
+      expect_false(result$valid, info = field)
+      expect_match(result$error, field)
+    }
+    for (value in c(0.25, 5, 10)) {
+      candidate <- base
+      candidate[[field]] <- value
+      expect_true(config$validate_config(candidate)$valid, info = field)
+    }
+  }
+  base$restart_delay <- 0
+  expect_true(config$validate_config(base)$valid)
+  base$health_check_interval <- 0
+  expect_false(config$validate_config(base)$valid)
+})
+
+test_that("appstart_timeout validates positive finite seconds", {
+  config <- ShinyServerConfig$new()
+  data <- list(
+    apps = list(list(name = "app", path = "/tmp/app")),
+    log_dir = "/tmp/logs", starting_port = 5001
+  )
+  for (value in list(0, -1, Inf, -Inf, NA_real_, NaN, "2", TRUE, NULL, numeric(), c(1, 2))) {
+    data$apps[[1]]["appstart_timeout"] <- list(value)
+    result <- config$validate_config(data)
+    expect_false(result$valid)
+    expect_match(result$error, "appstart_timeout")
+  }
+  for (value in c(0.5, 2, 60)) {
+    data$apps[[1]]$appstart_timeout <- value
+    expect_true(config$validate_config(data)$valid)
+  }
+})
+
+test_that("load_config defaults appstart_timeout independently for each app", {
+  config <- ShinyServerConfig$new()
+  path <- tempfile(fileext = ".json")
+  on.exit(unlink(path), add = TRUE)
+  writeLines(jsonlite::toJSON(list(
+    apps = list(
+      list(name = "default", path = "/tmp/default"),
+      list(name = "custom", path = "/tmp/custom", appstart_timeout = 12.5)
+    ),
+    log_dir = "/tmp/logs", starting_port = 5001
+  ), auto_unbox = TRUE), path)
+  local_mocked_bindings(is_port_in_use = function(host, port) FALSE)
+  config$load_config(path)
+  expect_equal(config$get_app_config("default")$appstart_timeout, 2)
+  expect_equal(config$get_app_config("custom")$appstart_timeout, 12.5)
+})
+
+test_that("long appstart_timeout extends startup state lifetime", {
+  config <- ShinyServerConfig$new()
+  config$config <- list(apps = list(list(name = "app", appstart_timeout = 60)))
+  assign("app", list(state = "starting", started_at = Sys.time() - 35),
+    envir = config$app_startup_state)
+  expect_equal(config$get_app_startup_state("app")$state, "starting")
+  assign("app", list(state = "starting", started_at = Sys.time() - 65),
+    envir = config$app_startup_state)
+  expect_equal(config$get_app_startup_state("app")$state, "timeout")
+})

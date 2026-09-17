@@ -1,7 +1,7 @@
 Package: tinyshinyserver
 Type: Package
 Title: Tiny 'shiny' Server - Lightweight Multi-App 'shiny' Proxy
-Version: 0.1.0
+Version: 0.2.0
 Authors@R: c(
     person(given = "Lars", family = "Bernhardsson", role = c("aut", "cre"), email = "cran.sherry228@passinbox.com")
     )
@@ -12,17 +12,18 @@ Description: A lightweight, 'WebSocket'-enabled proxy server for hosting multipl
 License: MIT + file LICENSE
 Encoding: UTF-8
 Depends: R (>= 4.0)
-Imports: methods, shiny, callr, jsonlite, later, httr, digest, httpuv,
-        websocket, future, logger, openssl, rmarkdown, quarto
+Imports: methods, shiny, callr, jsonlite, later, curl, promises,
+        digest, httpuv, websocket, future, logger, openssl, rmarkdown,
+        quarto
 Suggests: testthat (>= 3.0.0), roxygen2, devtools, DT, dplyr,
         flexdashboard, plotly
 Config/testthat/edition: 3
 URL: https://github.com/lab1702/tinyshinyserver
 BugReports: https://github.com/lab1702/tinyshinyserver/issues
-RoxygenNote: 7.3.3
+Config/roxygen2/version: 8.1.0
 NeedsCompilation: no
-Packaged: 2025-12-20 00:15:25 UTC; lab
+Packaged: 2026-09-17 00:26:23 UTC; lab
 Author: Lars Bernhardsson [aut, cre]
 Maintainer: Lars Bernhardsson <cran.sherry228@passinbox.com>
 Repository: CRAN
-Date/Publication: 2026-01-06 11:40:02 UTC
+Date/Publication: 2026-09-17 07:10:02 UTC

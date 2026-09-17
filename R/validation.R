@@ -85,6 +85,14 @@ validate_ws_message <- function(message, max_size = 1048576) {
     return(list(valid = FALSE, error = "Message is null"))
   }
 
+  # httpuv represents binary frames as raw vectors, including empty frames.
+  if (is.raw(message)) {
+    if (length(message) > max_size) {
+      return(list(valid = FALSE, error = "Message too large"))
+    }
+    return(list(valid = TRUE, sanitized = message))
+  }
+
   if (!is.character(message) || length(message) != 1) {
     return(list(valid = FALSE, error = "Invalid message type"))
   }
@@ -157,6 +165,10 @@ validate_port <- function(port) {
 
   if (!is.numeric(port) || length(port) != 1) {
     return(list(valid = FALSE, error = "Port must be a number"))
+  }
+
+  if (!is.finite(port) || port != floor(port)) {
+    return(list(valid = FALSE, error = "Port must be a finite integer"))
   }
 
   if (port < 1 || port > 65535) {

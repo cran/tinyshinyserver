@@ -31,6 +31,8 @@ TinyShinyServer <- setRefClass("TinyShinyServer",
       process_manager <<- create_process_manager(config)
       template_manager <<- create_template_manager()
       connection_manager <<- create_connection_manager(config, process_manager)
+      proxy_server <<- NULL
+      management_server <<- NULL
       is_shutting_down <<- FALSE
       cleanup_in_progress <<- FALSE
 
@@ -38,6 +40,11 @@ TinyShinyServer <- setRefClass("TinyShinyServer",
     },
     start = function() {
       "Start the complete server system"
+
+      # Cover failures before run_event_loop installs its own shutdown guard.
+      on.exit({
+        if (!is_shutting_down) shutdown()
+      }, add = TRUE)
 
       logger::log_info("Starting Tiny Shiny Server")
       logger::log_info("Press Ctrl-C to shutdown gracefully")
@@ -84,8 +91,12 @@ TinyShinyServer <- setRefClass("TinyShinyServer",
       # Health check scheduler
       schedule_health_check <- function() {
         if (!is_shutting_down) {
-          process_manager$health_check()
-          later::later(schedule_health_check, config$config$health_check_interval %||% 10)
+          tryCatch(process_manager$health_check(), error = function(e) {
+            logger::log_error("Health check failed: {error}", error = conditionMessage(e))
+          })
+          if (!is_shutting_down) {
+            later::later(schedule_health_check, config$config$health_check_interval %||% 10)
+          }
         }
       }
       later::later(schedule_health_check, 5)
