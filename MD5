@@ -1,7 +1,7 @@
-51cc3a8cc99bd7a99739fcaabfe92bf7 *DESCRIPTION
+77bc7939807223fba1bde7b472b6fd42 *DESCRIPTION
 ffa02da6bc30e5113a38e635b4e1acfc *LICENSE
 cd3c82bd9822f447a88fcb950523f765 *NAMESPACE
-e3f184a582c15c93001a9df2584e6cdc *NEWS.md
+f9631fad72a729f910ecd8ca6f32dbf3 *NEWS.md
 3eaa77b57626f114cd46fe43571e74c9 *R/config-format.R
 10a6cf3747a574a0e2038f1504f50944 *R/config.R
 da9f4a0855fe1835cc95dcfd76cd427e *R/connection_manager.R
@@ -13,7 +13,7 @@ a1017edc2695804fb17b094b64c27cd3 *R/process_manager.R
 bf79c7e46b8f559ec1a7461e6cd61f0d *R/template_manager.R
 f36d9e9a49e2511c307abaf363a2fbb1 *R/tinyshinyserver-package.R
 e533950b51f9527dde3a0595b6350cc0 *R/tss_main.R
-ae505c0fa24ec78bbb5b04c153117cb6 *R/utils.R
+64e4030801943905968ebc25653388c6 *R/utils.R
 f9c695547f84bb39e81cdee40643ec09 *R/validation.R
 5e28a161f3b10626714edaf962a3231f *README.md
 c47bfba4223a63a4c4dc8cc42fc5000f *inst/examples/config.json
@@ -36,15 +36,15 @@ defe03dda1471ea0c7c788fab07e686a *inst/examples/inventory/server.R
 a236ba03bf3873e25594c040db4d9276 *tests/test_config_minimal.json
 b4387ceedbecffad8a347045c585147e *tests/test_config_valid.json
 fcd1838e5cafb2004ef9401af837352c *tests/testthat.R
-9027e1d87a40f3b5370b2afb408b8ea9 *tests/testthat/helper-async.R
-e4102431c30f1151f82d44b1f275335b *tests/testthat/test-async-proxy.R
+e9656bd6c9eeb7718e8e73edd9929b7d *tests/testthat/helper-async.R
+aefc4438aba449c10bff5a06b8edd99e *tests/testthat/test-async-proxy.R
 f84a7e05328b97f3e3f582a39d41aa9e *tests/testthat/test-config.R
 1345dab6069be01601e9d7465a49274e *tests/testthat/test-connection-management.R
 796a4ca7e68b937aca2cae508c30b754 *tests/testthat/test-management-api.R
 9424508caca20f710d0207c5d3140ffb *tests/testthat/test-management-csrf.R
 02bf937c1bbfe5934f483aff3661cee6 *tests/testthat/test-p2-regressions.R
 10f0faefe84522bace2c326befec6cd7 *tests/testthat/test-process-manager.R
-51d6221212c7f7861882baa0d8e80846 *tests/testthat/test-review-regressions.R
+a35c7f187b3e0a2a6e4e716aefd2b601 *tests/testthat/test-review-regressions.R
 445f7c3b5c3b92caaee334cc4abe213c *tests/testthat/test-routing.R
 5777616de2c506378a4d289fe68cb6ed *tests/testthat/test-template-manager.R
 4cef01c21f7f51c6836fa2b0887f1b8e *tests/testthat/test-utils.R

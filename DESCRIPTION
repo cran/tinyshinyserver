@@ -1,7 +1,7 @@
 Package: tinyshinyserver
 Type: Package
 Title: Tiny 'shiny' Server - Lightweight Multi-App 'shiny' Proxy
-Version: 0.2.0
+Version: 0.2.1
 Authors@R: c(
     person(given = "Lars", family = "Bernhardsson", role = c("aut", "cre"), email = "cran.sherry228@passinbox.com")
     )
@@ -22,8 +22,8 @@ URL: https://github.com/lab1702/tinyshinyserver
 BugReports: https://github.com/lab1702/tinyshinyserver/issues
 Config/roxygen2/version: 8.1.0
 NeedsCompilation: no
-Packaged: 2026-09-17 00:26:23 UTC; lab
+Packaged: 2026-09-24 16:41:18 UTC; lab17
 Author: Lars Bernhardsson [aut, cre]
 Maintainer: Lars Bernhardsson <cran.sherry228@passinbox.com>
 Repository: CRAN
-Date/Publication: 2026-09-17 07:10:02 UTC
+Date/Publication: 2026-09-24 17:00:02 UTC
